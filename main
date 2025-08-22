@@ -1,0 +1,379 @@
+import os
+import telegram
+import google.generativeai as genai
+import requests
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from telegram import Update
+from google.cloud import firestore
+
+# --- VARIÁVEIS DE AMBIENTE ---
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")  # Use Access Token Production
+
+bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
+genai.configure(api_key=GOOGLE_API_KEY)
+
+# --- CONFIGURAÇÃO DO MODELO ---
+instrucoes_persona = """
+Você é uma mulher encantadora e inteligente.
+Atue com empatia, ouvindo atentamente.
+Responda com mensagens curtas, acolhedoras e práticas,
+Evitando respostas genéricas ou longas.
+"""
+model = genai.GenerativeModel(
+    model_name='gemini-1.5-flash-latest',
+    system_instruction=instrucoes_persona
+)
+
+# --- FIRESTORE ---
+def get_db():
+    return firestore.Client()
+
+# ----------------------------
+# USER DATA (assinatura, perfil)
+# ----------------------------
+def get_user_data(user_id):
+    db = get_db()
+    doc_ref = db.collection('users').document(str(user_id))
+    doc = doc_ref.get()
+    if doc.exists:
+        return doc.to_dict()
+    return {
+        "free_count": 0,
+        "premium": False,
+        "preapproval_id": None,
+        "premium_inicio": None,
+        "premium_expira": None,
+        "last_bot_message_id": None
+    }
+
+def save_user_data(user_id, data):
+    db = get_db()
+    db.collection('users').document(str(user_id)).set(data, merge=True)
+
+def set_premium_status(user_id, premium, preapproval_id=None, inicio=None, expira=None):
+    data = get_user_data(user_id)
+    data["premium"] = premium
+    if preapproval_id is not None:
+        data["preapproval_id"] = preapproval_id
+    if inicio is not None:
+        data["premium_inicio"] = inicio.isoformat() if isinstance(inicio, datetime) else inicio
+    if expira is not None:
+        data["premium_expira"] = expira.isoformat() if isinstance(expira, datetime) else expira
+    save_user_data(user_id, data)
+
+def is_premium_active(user_data):
+    if not user_data.get("premium", False):
+        return False
+    expira = user_data.get("premium_expira")
+    if expira is None:
+        return True  # Sem data de expiração, assume ativo
+    expira_dt = datetime.fromisoformat(expira)
+    return datetime.utcnow() < expira_dt
+
+def get_last_bot_message_id(user_id):
+    data = get_user_data(user_id)
+    return data.get("last_bot_message_id")
+
+def save_last_bot_message_id(user_id, message_id):
+    data = get_user_data(user_id)
+    data["last_bot_message_id"] = message_id
+    save_user_data(user_id, data)
+
+
+# ----------------------------
+# CONVERSATION DATA (histórico)
+# ----------------------------
+def get_chat_history(user_id):
+    """Recupera o histórico da conversa do usuário."""
+    db = get_db()
+    doc_ref = db.collection('conversations').document(str(user_id))
+    doc = doc_ref.get()
+    if doc.exists:
+        return doc.to_dict().get("history", [])
+    return []
+
+def update_chat_history(user_id, user_message, model_response):
+    """Salva a última interação (usuário e bot) no histórico."""
+    history = get_chat_history(user_id)
+    history.append({"role": "user", "parts": [user_message]})
+    history.append({"role": "model", "parts": [model_response]})
+    
+    # Limita o histórico para evitar crescimento excessivo
+    if len(history) > 40:
+        history = history[-40:]
+        
+    db = get_db()
+    db.collection('conversations').document(str(user_id)).set({"history": history}, merge=True)
+
+def clear_chat_history(user_id):
+    """Limpa o histórico de conversa do usuário."""
+    db = get_db()
+    db.collection('conversations').document(str(user_id)).set({"history": []})    
+
+
+# --- Mercado Pago - ASSINATURA RECORRENTE ---
+def criar_assinatura_recorrente(user_id):
+    url = "https://api.mercadopago.com/preapproval"
+    headers = {
+        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "payer_email": f"user_{user_id}@gmail.com",
+        "reason": "Assinatura Premium Bot",
+        "auto_recurring": {
+            "frequency": 1,
+            "frequency_type": "months",
+            "transaction_amount": 5.90,
+            "currency_id": "BRL"
+        },
+        "back_url": f"https://t.me/letitbeforlove",
+        "status": "pending",
+        "external_reference": str(user_id),
+        "notification_url": "https://telegram-bot-90593164761.southamerica-east1.run.app/mp_webhook"
+    }
+
+    r = requests.post(url, json=payload, headers=headers)
+    if r.status_code == 201:
+        resp = r.json()
+        return resp.get("init_point"), resp.get("id")
+    else:
+        print("[ERRO MP Assinatura]", r.status_code, r.text)
+        return None, None
+
+def cancelar_assinatura(preapproval_id):
+    url = f"https://api.mercadopago.com/preapproval/{preapproval_id}"
+    headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
+    payload = {"status": "cancelled"}
+    r = requests.put(url, json=payload, headers=headers)
+    return r.status_code == 200 or r.status_code == 204
+
+def get_preapproval_status(preapproval_id):
+    url = f"https://api.mercadopago.com/preapproval/{preapproval_id}"
+    headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
+    r = requests.get(url, headers=headers)
+    if r.status_code == 200:
+        return r.json()
+    else:
+        print("[ERRO MP Consulta Preapproval]", r.status_code, r.text)
+        return None
+
+def verificar_pagamento(payment_id):
+    url = f"https://api.mercadopago.com/v1/payments/{payment_id}"
+    headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
+    r = requests.get(url, headers=headers)
+    if r.status_code == 200:
+        return r.json()
+    else:
+        print("[ERRO Consulta Pagamento]", r.status_code, r.text)
+        return None
+
+# --- UTILITÁRIOS ---
+async def delete_message_safely(chat_id, msg_id):
+    if msg_id:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except telegram.error.BadRequest:
+            pass
+
+async def send_or_edit(chat_id, text, user_id, user_message_id=None):
+    # Deleta mensagem do usuário
+    if user_message_id:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=user_message_id)
+        except telegram.error.BadRequest:
+            pass
+
+    last_message_id = get_last_bot_message_id(user_id)
+    if last_message_id:
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=last_message_id, text=text)
+            return
+        except telegram.error.TelegramError:
+            # Se não conseguir editar (ex: mensagem antiga), envia nova
+            pass
+
+    sent = await bot.send_message(chat_id=chat_id, text=text)
+    save_last_bot_message_id(user_id, sent.message_id)
+
+# --- PROCESSADOR DE MENSAGENS ---
+async def process_telegram_update(update_json):
+    update = Update.de_json(update_json, bot)
+
+    if not update.message or not update.message.text:
+        return
+
+    user_id = update.effective_user.id
+    user_message = update.message.text.strip()
+    user_message_id = update.message.message_id
+    user_data = get_user_data(user_id)
+
+    # Atualiza status premium considerando expiração
+    if user_data.get("premium", False):
+        if user_data.get("premium_expira"):
+            expira_dt = datetime.fromisoformat(user_data["premium_expira"])
+            if datetime.utcnow() > expira_dt:
+                # Expirou, desativa premium
+                set_premium_status(user_id, False, preapproval_id=user_data.get("preapproval_id"))
+
+    # --- Comando /start ---
+    if user_message.startswith('/start'):
+        sent = await bot.send_message(
+            chat_id=user_id,
+            text="Olá! Seja bem-vindo(a) 😊",
+            parse_mode='HTML'
+        )
+        await delete_message_safely(user_id, user_message_id)
+        save_user_data(user_id, user_data)
+        save_last_bot_message_id(user_id, sent.message_id)
+        return
+
+    # --- Comando /reset ---
+    if user_message.startswith('/reset'):
+        clear_chat_history(user_id)
+        await send_or_edit(user_id, "Conversa reiniciada.", user_id, user_message_id)
+        return
+
+    # --- Comando /limpar ---
+    if user_message.startswith('/limpar'):
+        await send_or_edit(user_id, "Chat limpo.", user_id, user_message_id)
+        return
+
+    # --- Comando /suporte ---
+    if user_message.startswith('/suporte'):
+        telegram_link = "https://t.me/XeFe54"
+        suporte_msg = (
+            f"📩 Suporte\n\n"
+            f"Por favor, entre em contato pelo Telegram: {telegram_link}\n"
+            f"Informe neste chat o seu ID: {user_id}\n\n"
+            "Obrigado — nossa equipe responderá em breve."
+        )
+        await send_or_edit(user_id, suporte_msg, user_id, user_message_id)
+        return
+
+    # --- Comando /assinar ---
+    if user_message.startswith('/assinar'):
+        if is_premium_active(user_data):
+            await send_or_edit(user_id, "Você já é assinante Premium e sua assinatura está ativa.", user_id, user_message_id)
+            return
+
+        link, preapproval_id = criar_assinatura_recorrente(user_id)
+        if link:
+            set_premium_status(user_id, False, preapproval_id=preapproval_id)
+            msg = f"💳 Para ativar sua assinatura Premium, acesse o link e autorize a cobrança automática:\n\n{link}"
+        else:
+            msg = "Erro ao gerar link de assinatura. Tente novamente mais tarde."
+        await send_or_edit(user_id, msg, user_id, user_message_id)
+        return
+
+    # --- Comando /cancelar ---
+    if user_message.startswith('/cancelar'):
+        preapproval_id = user_data.get("preapproval_id")
+        if not preapproval_id:
+            await send_or_edit(user_id, "Você não possui assinatura ativa para cancelar.", user_id, user_message_id)
+            return
+        sucesso = cancelar_assinatura(preapproval_id)
+        if sucesso:
+            set_premium_status(user_id, False, preapproval_id=None, inicio=None, expira=None)
+            await send_or_edit(user_id, "✅ Sua assinatura foi cancelada com sucesso.", user_id, user_message_id)
+        else:
+            await send_or_edit(user_id, "Erro ao cancelar a assinatura. Tente novamente mais tarde.", user_id, user_message_id)
+        return
+
+    # --- Limite de mensagens grátis ---
+    if not is_premium_active(user_data):
+        free_count = user_data.get("free_count", 0)
+        if free_count >= 10:
+            await send_or_edit(user_id, "💳 Seu limite grátis acabou. Use /assinar para virar Premium.", user_id, user_message_id)
+            return
+        else:
+            user_data["free_count"] = free_count + 1
+            save_user_data(user_id, user_data)
+
+    # --- Fluxo normal com Gemini (com memória) ---
+    try:
+        history = get_chat_history(user_id)
+        chat_session = model.start_chat(history=history)
+        response = await chat_session.send_message_async(user_message)
+        resposta_ia = response.text
+
+        await send_or_edit(user_id, resposta_ia, user_id, user_message_id)
+        update_chat_history(user_id, user_message, resposta_ia)
+        
+    except Exception as e:
+        print(f"[ERRO Gemini] {e}")
+        await send_or_edit(user_id, "Oops, algo deu errado. Tente novamente.", user_id, user_message_id)
+
+# --- APP FastAPI ---
+def create_app():
+    app = FastAPI()
+
+    @app.post("/")
+    async def telegram_webhook(request: Request):
+        update_json = await request.json()
+        if update_json:
+            await process_telegram_update(update_json)
+        return JSONResponse(content={"status": "ok"})
+
+        @app.post("/mp_webhook")
+    async def mp_webhook(request: Request):
+        data = await request.json()
+        print("Webhook Mercado Pago recebido:", data)
+
+        if "data" not in data or "id" not in data["data"]:
+            return JSONResponse(content={"status": "no data id"}, status_code=400)
+
+        entity_id = data["data"]["id"]
+        topic = data.get("topic") or data.get("type")
+        action = data.get("action")  # <- pega a ação exata (payment.created, payment.updated, etc.)
+
+        user_id = None
+
+        # --- PAGAMENTOS ---
+        if topic == "payment" or action in ["payment.created", "payment.updated"]:
+            pagamento = verificar_pagamento(entity_id)
+            if pagamento and pagamento.get("status") == "approved":
+                preapproval_id = pagamento.get("preapproval_id")
+                if preapproval_id:
+                    assinatura = get_preapproval_status(preapproval_id)
+                    if assinatura:
+                        user_id = assinatura.get("external_reference")
+
+        # --- ASSINATURAS ---
+        elif topic == "preapproval" or action in ["preapproval.created", "preapproval.updated"]:
+            preapproval = get_preapproval_status(entity_id)
+            if preapproval:
+                status = preapproval.get("status")
+                temp_user_id = preapproval.get("external_reference")
+                if temp_user_id:
+                    if status in ["authorized", "active"]:
+                        user_id = temp_user_id
+                    elif status in ["cancelled", "paused"]:
+                        set_premium_status(temp_user_id, False, preapproval_id=None, inicio=None, expira=None)
+                        await bot.send_message(chat_id=int(temp_user_id), text="⚠️ Sua assinatura foi cancelada ou pausada.")
+
+        # --- ATIVAÇÃO CENTRALIZADA ---
+        if user_id:
+            print(f"Ativando premium para o usuário: {user_id}")
+            user_data = get_user_data(user_id)
+            set_premium_status(
+                user_id,
+                True,
+                preapproval_id=user_data.get("preapproval_id"),
+                inicio=datetime.utcnow(),
+                expira=datetime.utcnow() + relativedelta(months=1)
+            )
+            await bot.send_message(chat_id=int(user_id), text="✅ Pagamento confirmado! Sua assinatura Premium está ativa por 1 mês.")
+            
+        return JSONResponse(content={"status": "ok"})
+
+        
+    return app
+
+app = create_app()
