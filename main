@@ -316,37 +316,65 @@ def create_app():
 
     @app.post("/")
     async def telegram_webhook(request: Request):
+        # ... seu código do webhook do Telegram permanece igual ...
         update_json = await request.json()
         if update_json:
             await process_telegram_update(update_json)
         return JSONResponse(content={"status": "ok"})
 
-        @app.post("/mp_webhook")
+    # 👇 Substitua sua função antiga por esta versão corrigida 👇
+    @app.post("/mp_webhook")
     async def mp_webhook(request: Request):
-        data = await request.json()
-        print("Webhook Mercado Pago recebido:", data)
+        # --- Importe a exceção no início do arquivo ou dentro da função ---
+        from json import JSONDecodeError
 
+        # --- Tenta ler o corpo JSON ---
+        try:
+            data = await request.json()
+            print("Webhook Mercado Pago com JSON recebido:", data)
+        except JSONDecodeError:
+            # --- Se não houver corpo, usa os parâmetros da URL ---
+            params = request.query_params
+            print(f"Webhook Mercado Pago sem JSON (teste) recebido. Parâmetros: {params}")
+            
+            # --- Monta um dicionário 'data' simulado para o resto do código funcionar ---
+            if 'topic' in params and 'id' in params:
+                 data = {
+                    "topic": params.get("topic"),
+                    "data": {"id": params.get("id")}
+                }
+            else:
+                 # Se nem os parâmetros essenciais existirem, encerra
+                 return JSONResponse(content={"status": "no data"}, status_code=400)
+
+        # --- O resto da sua lógica continua funcionando como antes ---
         if "data" not in data or "id" not in data["data"]:
             return JSONResponse(content={"status": "no data id"}, status_code=400)
 
         entity_id = data["data"]["id"]
-        topic = data.get("topic") or data.get("type")
-        action = data.get("action")  # <- pega a ação exata (payment.created, payment.updated, etc.)
+        # Prioriza o 'topic' do corpo JSON, mas usa o da URL se não existir
+        topic = data.get("topic") or data.get("type") or request.query_params.get("topic")
+        action = data.get("action")
 
         user_id = None
 
         # --- PAGAMENTOS ---
-        if topic == "payment" or action in ["payment.created", "payment.updated"]:
+        if topic == "payment" or (action and "payment" in action):
             pagamento = verificar_pagamento(entity_id)
             if pagamento and pagamento.get("status") == "approved":
                 preapproval_id = pagamento.get("preapproval_id")
+                # Se for um pagamento avulso, podemos não ter preapproval_id
+                # Aqui você precisaria buscar o user_id de outra forma, talvez de 'external_reference' do pagamento
                 if preapproval_id:
                     assinatura = get_preapproval_status(preapproval_id)
                     if assinatura:
                         user_id = assinatura.get("external_reference")
+                else: # Lógica para pagamentos que não são de assinatura
+                    user_id = pagamento.get("external_reference")
+
 
         # --- ASSINATURAS ---
-        elif topic == "preapproval" or action in ["preapproval.created", "preapproval.updated"]:
+        elif topic == "preapproval" or (action and "preapproval" in action):
             preapproval = get_preapproval_status(entity_id)
             if preapproval:
                 status = preapproval.get("status")
@@ -361,19 +389,27 @@ def create_app():
         # --- ATIVAÇÃO CENTRALIZADA ---
         if user_id:
             print(f"Ativando premium para o usuário: {user_id}")
+            # Buscando o preapproval_id do usuário, caso já exista
             user_data = get_user_data(user_id)
+            preapproval_id = user_data.get("preapproval_id")
+
+            # Se a notificação for de um pagamento, pode ser um novo preapproval_id
+            if topic == 'payment':
+                pagamento_info = verificar_pagamento(entity_id)
+                if pagamento_info and pagamento_info.get("preapproval_id"):
+                    preapproval_id = pagamento_info.get("preapproval_id")
+
             set_premium_status(
                 user_id,
                 True,
-                preapproval_id=user_data.get("preapproval_id"),
+                preapproval_id=preapproval_id, # Salva o preapproval_id correto
                 inicio=datetime.utcnow(),
                 expira=datetime.utcnow() + relativedelta(months=1)
             )
             await bot.send_message(chat_id=int(user_id), text="✅ Pagamento confirmado! Sua assinatura Premium está ativa por 1 mês.")
-            
+        
         return JSONResponse(content={"status": "ok"})
 
-        
     return app
 
 app = create_app()
