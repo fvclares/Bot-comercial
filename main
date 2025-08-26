@@ -8,8 +8,6 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from telegram import Update
 from google.cloud import firestore
-from json import JSONDecodeError
-
 
 # --- VARIÁVEIS DE AMBIENTE ---
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -120,33 +118,68 @@ def clear_chat_history(user_id):
 
 # --- Mercado Pago - ASSINATURA RECORRENTE ---
 def criar_assinatura_recorrente(user_id):
-    url = "https://api.mercadopago.com/preapproval"
+    """Cria uma preferência de checkout buscando os dados do plano dinamicamente."""
+    url = "https://api.mercadopago.com/checkout/preferences"
     headers = {
         "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
         "Content-Type": "application/json"
     }
 
+    # Use o ID do plano que você já criou no painel do MP
+    PREAPPROVAL_PLAN_ID = "e9a2f49c6e3246a9b52f1d44ac3cffab" 
+
+    # Busca os detalhes do plano para não ter preço fixo no código
+    plan_details = get_preapproval_plan_details(PREAPPROVAL_PLAN_ID)
+
+    if not plan_details:
+        print("Não foi possível obter os detalhes do plano de assinatura.")
+        return None, None
+
+    # Usa os dados retornados pela API para montar o payload
+    plan_title = plan_details.get("reason", "Assinatura Premium Bot")
+    plan_price = plan_details.get("auto_recurring", {}).get("transaction_amount")
+
     payload = {
-        "reason": "Assinatura Premium Bot",
-        "auto_recurring": {
-            "frequency": 1,
-            "frequency_type": "months",
-            "transaction_amount": 5.90,
-            "currency_id": "BRL"
+        "items": [
+            {
+                "title": plan_title,
+                "description": "Acesso aos recursos premium do bot",
+                "quantity": 1,
+                "currency_id": "BRL",
+                "unit_price": plan_price
+            }
+        ],
+        "preapproval_plan_id": PREAPPROVAL_PLAN_ID,
+        "back_urls": {
+            "success": "https://t.me/letitbeforlove",
         },
-        "back_url": f"https://t.me/letitbeforlove",
-        "status": "pending",
+        "notification_url": "https://telegram-bot-90593164761.southamerica-east1.run.app/mp_webhook",
         "external_reference": str(user_id),
-        "notification_url": "https://telegram-bot-90593164761.southamerica-east1.run.app/mp_webhook"
     }
 
     r = requests.post(url, json=payload, headers=headers)
+    
     if r.status_code == 201:
         resp = r.json()
         return resp.get("init_point"), resp.get("id")
     else:
-        print("[ERRO MP Assinatura]", r.status_code, r.text)
+        print("[ERRO MP Preferência]", r.status_code, r.text)
         return None, None
+
+
+def get_preapproval_plan_details(plan_id):
+    """Busca os detalhes de um Plano de Assinatura específico."""
+    url = f"https://api.mercadopago.com/preapproval_plan/{plan_id}"
+    headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
+    
+    r = requests.get(url, headers=headers)
+    
+    if r.status_code == 200:
+        return r.json()
+    else:
+        print(f"[ERRO MP Consulta Plano {plan_id}]", r.status_code, r.text)
+        return None
+
 
 def cancelar_assinatura(preapproval_id):
     url = f"https://api.mercadopago.com/preapproval/{preapproval_id}"
@@ -314,49 +347,49 @@ async def process_telegram_update(update_json):
 # --- APP FastAPI ---
 def create_app():
     app = FastAPI()
-    
+
     @app.post("/")
     async def telegram_webhook(request: Request):
+        # ... seu código do webhook do Telegram permanece igual ...
         update_json = await request.json()
         if update_json:
             await process_telegram_update(update_json)
         return JSONResponse(content={"status": "ok"})
 
-
-    # 👇 Substitua sua função mp_webhook por esta nova versão 👇
+    # 👇 Substitua sua função antiga por esta versão corrigida 👇
     @app.post("/mp_webhook")
     async def mp_webhook(request: Request):
-        data = {}
-        # Tenta ler o corpo JSON, se não houver, usa os parâmetros da URL (para o teste do painel)
+        # --- Importe a exceção no início do arquivo ou dentro da função ---
+        from json import JSONDecodeError
+
+        # --- Tenta ler o corpo JSON ---
         try:
             data = await request.json()
-            print("Webhook Mercado Pago recebido:", data)
+            print("Webhook Mercado Pago com JSON recebido:", data)
         except JSONDecodeError:
+            # --- Se não houver corpo, usa os parâmetros da URL ---
             params = request.query_params
-            print(f"Webhook de Teste (sem JSON) recebido. Parâmetros: {params}")
+            print(f"Webhook Mercado Pago sem JSON (teste) recebido. Parâmetros: {params}")
+            
+            # --- Monta um dicionário 'data' simulado para o resto do código funcionar ---
             if 'topic' in params and 'id' in params:
-                # Simula o formato v2.0 para o teste do painel
-                data = {"topic": params.get("topic"), "resource": params.get("id")}
+                 data = {
+                    "topic": params.get("topic"),
+                    "data": {"id": params.get("id")}
+                }
             else:
-                return JSONResponse(content={"status": "no data"}, status_code=400)
+                 # Se nem os parâmetros essenciais existirem, encerra
+                 return JSONResponse(content={"status": "no data"}, status_code=400)
 
-        # --- LÓGICA ATUALIZADA PARA EXTRAIR O ID ---
-        entity_id = None
-        topic = None
+        # --- O resto da sua lógica continua funcionando como antes ---
+        if "data" not in data or "id" not in data["data"]:
+            return JSONResponse(content={"status": "no data id"}, status_code=400)
 
-        if "resource" in data and "topic" in data: # <<< MUDANÇA AQUI (Formato IPN v2.0)
-            entity_id = data["resource"]
-            topic = data["topic"]
-        elif "data" in data and "id" in data["data"]: # <<< Lógica antiga (Formato Webhooks)
-            entity_id = data["data"]["id"]
-            topic = data.get("type") # No formato antigo, o tópico vem no campo 'type'
-        
-        # Se após as verificações não encontrou um ID, rejeita a notificação
-        if not entity_id or not topic:
-            return JSONResponse(content={"status": "invalid notification format"}, status_code=400)
-        
-        # --- O resto da sua lógica continua funcionando, usando entity_id e topic ---
+        entity_id = data["data"]["id"]
+        # Prioriza o 'topic' do corpo JSON, mas usa o da URL se não existir
+        topic = data.get("topic") or data.get("type") or request.query_params.get("topic")
         action = data.get("action")
+
         user_id = None
 
         # --- PAGAMENTOS ---
@@ -364,15 +397,18 @@ def create_app():
             pagamento = verificar_pagamento(entity_id)
             if pagamento and pagamento.get("status") == "approved":
                 preapproval_id = pagamento.get("preapproval_id")
+                # Se for um pagamento avulso, podemos não ter preapproval_id
+                # Aqui você precisaria buscar o user_id de outra forma, talvez de 'external_reference' do pagamento
                 if preapproval_id:
                     assinatura = get_preapproval_status(preapproval_id)
                     if assinatura:
                         user_id = assinatura.get("external_reference")
-                else:
+                else: # Lógica para pagamentos que não são de assinatura
                     user_id = pagamento.get("external_reference")
 
+
         # --- ASSINATURAS ---
-        elif topic == "preapproval" or topic == "subscription_preapproval" or (action and "preapproval" in action):
+        elif topic == "preapproval" or (action and "preapproval" in action):
             preapproval = get_preapproval_status(entity_id)
             if preapproval:
                 status = preapproval.get("status")
@@ -387,23 +423,20 @@ def create_app():
         # --- ATIVAÇÃO CENTRALIZADA ---
         if user_id:
             print(f"Ativando premium para o usuário: {user_id}")
+            # Buscando o preapproval_id do usuário, caso já exista
             user_data = get_user_data(user_id)
-            
-            # Garante que estamos pegando o ID da assinatura correto
-            preapproval_id_final = user_data.get("preapproval_id")
-            if topic in ["payment", "preapproval", "subscription_preapproval"]:
-                 # Se for uma notificação de preapproval, o entity_id é o próprio preapproval_id
-                 if topic in ["preapproval", "subscription_preapproval"]:
-                      preapproval_id_final = entity_id
-                 else: # Se for de payment, busca dentro do pagamento
-                      pagamento_info = verificar_pagamento(entity_id)
-                      if pagamento_info and pagamento_info.get("preapproval_id"):
-                          preapproval_id_final = pagamento_info.get("preapproval_id")
+            preapproval_id = user_data.get("preapproval_id")
+
+            # Se a notificação for de um pagamento, pode ser um novo preapproval_id
+            if topic == 'payment':
+                pagamento_info = verificar_pagamento(entity_id)
+                if pagamento_info and pagamento_info.get("preapproval_id"):
+                    preapproval_id = pagamento_info.get("preapproval_id")
 
             set_premium_status(
                 user_id,
                 True,
-                preapproval_id=preapproval_id_final,
+                preapproval_id=preapproval_id, # Salva o preapproval_id correto
                 inicio=datetime.utcnow(),
                 expira=datetime.utcnow() + relativedelta(months=1)
             )
